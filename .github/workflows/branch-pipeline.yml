@@ -149,7 +149,7 @@ jobs:
           restore-keys: trivy-db-
 
       - name: Trivy Scan (human-readable summary for logs)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.24.0
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
           format: table
