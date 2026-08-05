@@ -1,0 +1,114 @@
+name: Prod Pipeline
+
+# Triggers when a release/** branch is merged into main — i.e. exactly
+# "Prod should start deployment when I merge release branch to main
+# branch." No image is built here either. The release branch's tip commit
+# was already validated end-to-end in qa and stg by nonprod-pipeline.yml;
+# this workflow's only job is to find that EXACT commit and promote its
+# already-built, already-scanned image to prod, unchanged.
+#
+# IMPORTANT — this requires merging release/** into main using GitHub's
+# "Create a merge commit" strategy (NOT "Squash and merge" or "Rebase and
+# merge"). A merge commit has two parents: main's previous tip, and the
+# release branch's tip. That second parent is how this workflow finds the
+# already-validated commit — squash/rebase merges create a brand new
+# commit with no traceable link back to what nonprod actually tested.
+# Enforce this once in: Settings → General → Pull Requests → uncheck
+# "Allow squash merging" and "Allow rebase merging", leaving only "Allow
+# merge commits" checked.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: prod-pipeline-${{ github.ref }}
+  cancel-in-progress: false # never cancel an in-flight prod deploy
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Walk back through the merge commit to find the release branch's tip —
+  # the exact commit nonprod-pipeline.yml already validated in qa and stg.
+  # ---------------------------------------------------------------------
+  resolve-validated-commit:
+    name: Resolve Already-Validated Commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      image-tag: ${{ steps.resolve.outputs.image_tag }}
+    steps:
+      - name: Checkout with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need parent commits, not just this one
+
+      - name: Find release branch's tip via merge commit's second parent
+        id: resolve
+        run: |
+          PARENTS=$(git log -1 --pretty=%P HEAD)
+          PARENT_COUNT=$(echo "$PARENTS" | wc -w)
+
+          if [ "$PARENT_COUNT" -lt 2 ]; then
+            echo "::error::HEAD on main has only $PARENT_COUNT parent commit(s), so this wasn't a \
+          merge commit. This pipeline requires release/** to be merged into main using GitHub's \
+          'Create a merge commit' strategy — 'Squash and merge' and 'Rebase and merge' both produce \
+          a brand-new commit with no traceable link back to the exact commit qa/stg already \
+          validated. Check Settings → General → Pull Requests and ensure only 'Allow merge commits' \
+          is enabled, then re-merge properly."
+            exit 1
+          fi
+
+          RELEASE_TIP=$(echo "$PARENTS" | awk '{print $2}')
+          echo "Merge commit parents: $PARENTS"
+          echo "Resolved release branch tip (validated in qa/stg): $RELEASE_TIP"
+          echo "image_tag=${RELEASE_TIP:0:12}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------
+  # Confirm that exact commit's image genuinely exists in ECR before
+  # attempting to deploy it — same fail-fast principle as
+  # nonprod-pipeline.yml's verify-image job.
+  # ---------------------------------------------------------------------
+  verify-image:
+    name: Verify Image Exists in ECR
+    runs-on: ubuntu-24.04
+    needs: resolve-validated-commit
+    timeout-minutes: 10
+    steps:
+      - name: Configure AWS credentials via OIDC (shared build/push account)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Check image tag exists in ECR
+        env:
+          IMAGE_TAG: ${{ needs.resolve-validated-commit.outputs.image-tag }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+        run: |
+          if ! aws ecr describe-images \
+                --repository-name "$ECR_REPOSITORY" \
+                --image-ids imageTag="$IMAGE_TAG" > /dev/null 2>&1; then
+            echo "::error::No image tagged '$IMAGE_TAG' found in ECR repository '$ECR_REPOSITORY'. \
+          This shouldn't happen if the release branch went through Nonprod Pipeline successfully — \
+          check that qa/stg deployment actually completed for this release branch before merging \
+          to main."
+            exit 1
+          fi
+          echo "Confirmed image $ECR_REPOSITORY:$IMAGE_TAG exists in ECR."
+
+  # ---------------------------------------------------------------------
+  # Deploy. cd.yml's job sets `environment: prod`, which is what enforces
+  # the required-reviewers manual approval gate configured on that
+  # GitHub Environment — the workflow will pause here until approved.
+  # ---------------------------------------------------------------------
+  deploy-prod:
+    name: Deploy to prod
+    needs: [resolve-validated-commit, verify-image]
+    uses: ./.github/workflows/cd.yml
+    with:
+      environment: prod
+      image-tag: ${{ needs.resolve-validated-commit.outputs.image-tag }}
+    secrets: inherit

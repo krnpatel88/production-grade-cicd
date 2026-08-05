@@ -1,0 +1,144 @@
+name: CD - Deploy to ECS
+
+# Reusable workflow: renders a new ECS Task Definition revision pointing at
+# an already-built, already-scanned image, updates the ECS Service, and
+# waits for the deployment to stabilize. It never builds or pushes an
+# image — that happens exactly once, in branch-pipeline.yml. Called once
+# per environment (dev | qa | stg | prod) with a different `environment`
+# input, which is what lets each call assume a different AWS account's IAM
+# role via GitHub Environment-scoped secrets/vars.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "GitHub Environment name (dev | qa | stg | prod)"
+        required: true
+        type: string
+      image-tag:
+        description: "Git-SHA tag of the immutable image to deploy"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write # required for GitHub OIDC -> AWS AssumeRole
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Binding the job to a GitHub Environment is what enforces the manual
+    # approval gate configured on the "prod" environment in repo settings,
+    # and what scopes the secrets/vars below to this environment only.
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC (${{ inputs.environment }} account)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          # This role ARN comes from the environment's own secrets, so each
+          # environment can point at a completely different AWS account
+          # with no code changes — only environment configuration changes.
+
+      - name: Login to Amazon ECR (source registry)
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Render ECS task definition from template
+        id: render-template
+        env:
+          ECS_TASK_FAMILY: ${{ vars.ECS_TASK_DEFINITION }}
+          ECS_EXECUTION_ROLE_ARN: ${{ secrets.ECS_EXECUTION_ROLE_ARN }}
+          ECS_TASK_ROLE_ARN: ${{ secrets.ECS_TASK_ROLE_ARN }}
+          ECS_CONTAINER_NAME: ${{ vars.ECS_CONTAINER_NAME }}
+          ECS_LOG_GROUP: ${{ vars.ECS_LOG_GROUP }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          APP_ENV: ${{ inputs.environment }}
+          IMAGE_URI: "${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ inputs.image-tag }}"
+        run: |
+          envsubst < ecs/task-definition.template.json > ecs/task-definition.rendered.json
+          cat ecs/task-definition.rendered.json
+
+      - name: Validate rendered task definition (fail fast on empty placeholders)
+        run: |
+          # envsubst silently substitutes an empty string for any unset
+          # variable rather than erroring, which turns a missing
+          # GitHub Environment secret/variable into a confusing AWS-side
+          # error several steps later (e.g. "Fargate requires execution
+          # role ARN"). Catch that here instead, with a clear message
+          # naming exactly which field is empty.
+          python3 - <<'EOF'
+          import json, sys
+          with open("ecs/task-definition.rendered.json") as f:
+              td = json.load(f)
+          required = ["family", "executionRoleArn", "taskRoleArn"]
+          missing = [k for k in required if not td.get(k)]
+          container = (td.get("containerDefinitions") or [{}])[0]
+          if not container.get("image"):
+              missing.append("containerDefinitions[0].image")
+          log_opts = (container.get("logConfiguration") or {}).get("options", {})
+          if not log_opts.get("awslogs-group"):
+              missing.append("containerDefinitions[0].logConfiguration.options.awslogs-group")
+
+          # Sanity-check the image URI itself: catches the common
+          # misconfiguration where an environment's ECR_REGISTRY variable
+          # already includes the repository name, so appending
+          # ECR_REPOSITORY on top doubles it up (e.g.
+          # ".../fastapi-ecs-sample/fastapi-ecs-sample:sha" instead of
+          # ".../fastapi-ecs-sample:sha") — ECS then fails at deploy time
+          # with a confusing "image not found" error instead of at this
+          # earlier, clearer check.
+          image = container.get("image", "")
+          repo_name = "${{ vars.ECR_REPOSITORY }}"
+          if image.count(f"/{repo_name}/") > 0 or image.count(f"{repo_name}/{repo_name}") > 0:
+              print(f"::error::Image URI '{image}' appears to contain the repository name "
+                    f"'{repo_name}' twice. Check the 'ECR_REGISTRY' variable on the "
+                    f"'${{ inputs.environment }}' environment — it should be just the bare "
+                    f"registry hostname (e.g. '123456789012.dkr.ecr.us-east-1.amazonaws.com'), "
+                    f"NOT including the repository name.")
+              sys.exit(1)
+
+          if missing:
+              print(f"::error::Rendered task definition has empty required field(s): {', '.join(missing)}. "
+                    f"Check the corresponding GitHub Environment secret/variable is set on the "
+                    f"'${{ inputs.environment }}' environment (Settings → Environments → ${{ inputs.environment }}).")
+              sys.exit(1)
+          print("Task definition validation passed: all required fields are populated.")
+          EOF
+
+      - name: Register new ECS Task Definition revision
+        id: register-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ecs/task-definition.rendered.json
+          container-name: ${{ vars.ECS_CONTAINER_NAME }}
+          image: "${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ inputs.image-tag }}"
+
+      - name: Deploy new Task Definition to ECS Service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.register-task-def.outputs.task-definition }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          service: ${{ vars.ECS_SERVICE }}
+          wait-for-service-stability: true
+          # This is the "Wait until the deployment completes successfully"
+          # requirement: the action polls ECS until the service reaches a
+          # steady state, and fails the job if it doesn't within the
+          # default timeout.
+
+      - name: Verify ECS deployment health
+        env:
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+        run: |
+          echo "Checking running task count and health status for $ECS_SERVICE..."
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query "services[0].{status:status,running:runningCount,desired:desiredCount,deployments:deployments[*].rolloutState}" \
+            --output table

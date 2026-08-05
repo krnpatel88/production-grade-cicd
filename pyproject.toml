@@ -1,0 +1,26 @@
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra --cov=app --cov-report=term-missing --cov-report=xml:coverage.xml --cov-report=html:htmlcov --cov-fail-under=80"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+omit = ["app/__init__.py"]
+# Store paths in coverage.xml as relative (e.g. "app/config.py") instead of
+# absolute ("C:/Users/.../app/config.py" on Windows, "/home/.../app/config.py"
+# on Linux). Without this, coverage.xml generated on one machine/OS can't be
+# resolved by a scanner running in a different filesystem (e.g. a Windows
+# host running pytest vs. the Linux sonar-scanner-cli Docker container, or
+# a GitHub Actions Linux runner).
+relative_files = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

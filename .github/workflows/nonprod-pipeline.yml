@@ -1,0 +1,98 @@
+name: Nonprod Pipeline
+
+# Triggers the moment a pull request is OPENED (or updated) targeting a
+# release/** branch — i.e. exactly "Non prod should start deployment when I
+# create an MR from feature to release branch." No image is built here:
+# the PR's head commit was already built and pushed to ECR by
+# branch-pipeline.yml when that commit was pushed to its source branch
+# (feature/* or develop). This workflow only verifies that image exists
+# and promotes it — by the same Git SHA tag — first to qa, then to stg.
+# "Build once, deploy many" therefore holds across the ENTIRE promotion
+# chain (dev → qa → stg → prod), not just across manual re-deploys.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [release/**]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  # One in-flight nonprod deployment per PR — a rapid string of commits to
+  # the same PR shouldn't race multiple qa/stg deployments against each
+  # other.
+  group: nonprod-pipeline-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Verify the PR's head commit was actually built by branch-pipeline.yml
+  # before attempting to deploy it anywhere. Without this check, opening a
+  # PR immediately after pushing (before branch-pipeline.yml finishes, or
+  # if it failed) would fail with a confusing "image not found" error deep
+  # inside the ECS deploy step instead of a clear message here.
+  # ---------------------------------------------------------------------
+  verify-image:
+    name: Verify Image Exists in ECR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      image-tag: ${{ steps.vars.outputs.image_tag }}
+    steps:
+      - name: Compute image tag from PR head SHA
+        id: vars
+        run: echo "image_tag=${SHA::12}" >> "$GITHUB_OUTPUT"
+        env:
+          SHA: ${{ github.event.pull_request.head.sha }}
+
+      - name: Configure AWS credentials via OIDC (shared build/push account)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Check image tag exists in ECR
+        env:
+          IMAGE_TAG: ${{ steps.vars.outputs.image_tag }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+        run: |
+          if ! aws ecr describe-images \
+                --repository-name "$ECR_REPOSITORY" \
+                --image-ids imageTag="$IMAGE_TAG" > /dev/null 2>&1; then
+            echo "::error::No image tagged '$IMAGE_TAG' found in ECR repository '$ECR_REPOSITORY'. \
+          This means Branch Pipeline hasn't finished (or failed) for this PR's head commit \
+          (${{ github.event.pull_request.head.sha }}) on branch '${{ github.event.pull_request.head.ref }}'. \
+          Check the Branch Pipeline run for that branch/commit, fix any failure, then re-push \
+          to this PR to re-trigger this workflow."
+            exit 1
+          fi
+          echo "Confirmed image $ECR_REPOSITORY:$IMAGE_TAG exists in ECR."
+
+  # ---------------------------------------------------------------------
+  # Deploy to qa first.
+  # ---------------------------------------------------------------------
+  deploy-qa:
+    name: Deploy to qa
+    needs: verify-image
+    uses: ./.github/workflows/cd.yml
+    with:
+      environment: qa
+      image-tag: ${{ needs.verify-image.outputs.image-tag }}
+    secrets: inherit
+
+  # ---------------------------------------------------------------------
+  # Deploy to stg only after qa succeeds. If your organization wants a
+  # human checkpoint between qa and stg (rather than fully automatic
+  # promotion), add a "required reviewers" protection rule on the `stg`
+  # GitHub Environment — cd.yml's job already sets `environment: stg`,
+  # which is all that's needed to make that rule apply here.
+  # ---------------------------------------------------------------------
+  deploy-stg:
+    name: Deploy to stg
+    needs: [verify-image, deploy-qa]
+    uses: ./.github/workflows/cd.yml
+    with:
+      environment: stg
+      image-tag: ${{ needs.verify-image.outputs.image-tag }}
+    secrets: inherit

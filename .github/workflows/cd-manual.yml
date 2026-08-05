@@ -1,0 +1,39 @@
+name: CD - Manual Promotion / Rollback
+
+# Manually deploy any already-built, already-scanned image (identified by
+# its Git SHA tag) to any environment. Two uses:
+#   1. Ad-hoc deployment outside the normal branch/PR/merge triggers.
+#   2. ROLLBACK: if a deployment causes problems, re-run this with the
+#      previous known-good image tag and the affected environment — no
+#      rebuild, no code change, just re-pointing that environment's ECS
+#      service at an image it (or another environment) already ran
+#      successfully before.
+#
+# No image is built here — this workflow only ever references a tag that
+# branch-pipeline.yml already pushed to ECR, preserving "build once,
+# deploy many" even during a rollback.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, qa, stg, prod]
+      image-tag:
+        description: "Git SHA tag of the image to deploy/roll back to (first 12 chars)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy
+    uses: ./.github/workflows/cd.yml
+    with:
+      environment: ${{ inputs.environment }}
+      image-tag: ${{ inputs.image-tag }}
+    secrets: inherit
