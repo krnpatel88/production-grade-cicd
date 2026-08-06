@@ -90,7 +90,7 @@ jobs:
   # ---------------------------------------------------------------------
   deploy-stg:
     name: Deploy to stg
-    needs: [verify-image, deploy-qa]
+    needs: [verify-image]
     uses: ./.github/workflows/cd.yml
     with:
       environment: stg
