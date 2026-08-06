@@ -72,14 +72,14 @@ jobs:
   # ---------------------------------------------------------------------
   # Deploy to qa first.
   # ---------------------------------------------------------------------
-  deploy-qa:
-    name: Deploy to qa
-    needs: verify-image
-    uses: ./.github/workflows/cd.yml
-    with:
-      environment: qa
-      image-tag: ${{ needs.verify-image.outputs.image-tag }}
-    secrets: inherit
+  # deploy-qa:
+  #   name: Deploy to qa
+  #   needs: verify-image
+  #   uses: ./.github/workflows/cd.yml
+  #   with:
+  #     environment: qa
+  #     image-tag: ${{ needs.verify-image.outputs.image-tag }}
+  #   secrets: inherit
 
   # ---------------------------------------------------------------------
   # Deploy to stg only after qa succeeds. If your organization wants a
