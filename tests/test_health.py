@@ -9,7 +9,7 @@ def test_health_returns_200(client):
 def test_health_body_shape(client):
     response = client.get("/health")
     body = response.json()
-    assert body["status"] == "ok"
+    assert body["status"] == "ok Kiran"
     assert "app_name" in body
     assert "app_env" in body
     assert "app_version" in body

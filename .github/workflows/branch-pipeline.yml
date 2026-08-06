@@ -79,20 +79,20 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # fetch-depth: 0 (full history) is still needed here even though
+          # we're not running tests — SonarCloud uses git blame history for
+          # "new code" detection and issue assignment.
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Download coverage report from test job
+        uses: actions/download-artifact@v4
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-
-      - name: Install dependencies
-        run: pip install -r requirements-dev.txt
-
-      - name: Re-run tests to regenerate coverage.xml for this job
-        run: pytest
-        # Coverage must be generated in the same job that runs the Sonar
-        # scan so the file path in sonar-project.properties resolves.
+          name: coverage-report-${{ github.run_id }}
+          path: .
+        # Reuses the exact coverage.xml the `test` job already generated,
+        # instead of re-installing Python/deps and re-running the full
+        # suite just to regenerate a file we already have. Faster, and
+        # guarantees SonarCloud analyzes the SAME coverage result `test`
+        # reported — no risk of the two runs silently disagreeing.
 
       - name: SonarCloud Scan
         uses: SonarSource/sonarqube-scan-action@v4
@@ -149,7 +149,7 @@ jobs:
           restore-keys: trivy-db-
 
       - name: Trivy Scan (human-readable summary for logs)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.24.0
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
           format: table
@@ -157,6 +157,15 @@ jobs:
           exit-code: "0" # informational only — does not fail the job
           ignore-unfixed: true
           cache-dir: ${{ github.workspace }}/.trivy-cache
+
+      - name: Debug OIDC token claims
+        run: |
+          curl -sSL -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
+            | jq -r '.value' | cut -d'.' -f2 | base64 -d 2>/dev/null | jq .
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
+          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}      
 
       - name: Configure AWS credentials via OIDC (shared build/push account)
         uses: aws-actions/configure-aws-credentials@v4

@@ -18,7 +18,7 @@ def health_check() -> HealthResponse:
     """
     settings = get_settings()
     return HealthResponse(
-        status="ok",
+        status="ok Kiran",
         app_name=settings.app_name,
         app_env=settings.app_env,
         app_version=settings.app_version,
