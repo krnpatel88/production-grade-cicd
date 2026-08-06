@@ -11,6 +11,7 @@ from app.models import User, UserCreate
 _USERS: list[User] = [
     User(name="Ada Lovelace", email="ada@example.com"),
     User(name="Alan Turing", email="alan@example.com"),
+    User(name="Kiran Patel", email="kiran@example.com")
 ]
 
 
